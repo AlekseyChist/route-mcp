@@ -44,6 +44,15 @@ private val BROUTER_URL = System.getenv("BROUTER_URL") ?: "https://brouter.de"
 // Куда складывать полные GPX на маке
 private val ROUTES_DIR = File(System.getenv("ROUTES_DIR") ?: "${System.getProperty("user.home")}/Routes")
 
+// Strava API: client_id/client_secret из приложения на strava.com/settings/api, refresh_token — из однократного OAuth.
+// Все три нужны, чтобы find_popular_segments мог сам обновлять access_token; без них инструмент вернёт понятную ошибку.
+private val STRAVA_CLIENT_ID = System.getenv("STRAVA_CLIENT_ID")
+private val STRAVA_CLIENT_SECRET = System.getenv("STRAVA_CLIENT_SECRET")
+private val STRAVA_REFRESH_TOKEN = System.getenv("STRAVA_REFRESH_TOKEN")
+private val STRAVA_CACHE_FILE = File(
+    System.getenv("STRAVA_CACHE_FILE") ?: "${System.getProperty("user.home")}/.secrets/route-mcp-strava-cache.json",
+)
+
 fun main() {
     // По stdout идёт JSON-RPC, и ничего кроме него: одна лишняя строка ломает транспорт.
     // Библиотеки об этом не знают (kotlin-logging печатает в stdout строку при инициализации),
@@ -67,6 +76,9 @@ fun main() {
         )
         server.registerGeocode(Geocoder(http))
         server.registerPlanRoute(BRouterApi(http, BROUTER_URL))
+        server.registerFindPopularSegments(
+            StravaApi(http, STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRESH_TOKEN, STRAVA_CACHE_FILE),
+        )
 
         // stdio: Claude Desktop запускает jar и общается с ним через stdin/stdout (JSON-RPC)
         val transport = StdioServerTransport(
@@ -213,6 +225,75 @@ private fun Server.registerPlanRoute(brouter: BRouterApi) {
                 TextContent(summary),
                 TextContent(toGpx(name, simplified)),
             ),
+        )
+    }
+}
+
+private fun Server.registerFindPopularSegments(strava: StravaApi) {
+    addTool(
+        name = "find_popular_segments",
+        description = """
+            Find the most popular Strava segments near a point (Strava's own Segments Explore
+            ranking — not the heatmap, which Strava does not expose to third-party apps).
+            A good proxy for "where people actually ride/run", but discrete: segments are
+            individual stretches (often climbs), not a continuous surface like a heatmap.
+            Returns each segment's distance, average grade, climb category and start/end
+            coordinates — feed those straight into plan_route's waypoints to route through it.
+            activity_type: riding (default) or running.
+        """.trimIndent(),
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("lat") { put("type", "number"); put("description", "Center latitude") }
+                putJsonObject("lon") { put("type", "number"); put("description", "Center longitude") }
+                putJsonObject("radius_km") {
+                    put("type", "number")
+                    put("description", "Search radius around the point in km, default 5 (max 25)")
+                }
+                putJsonObject("activity_type") {
+                    put("type", "string")
+                    put("description", "riding (default) or running")
+                }
+                putJsonObject("limit") {
+                    put("type", "integer")
+                    put("description", "Max segments to return, default 10")
+                }
+            },
+            required = listOf("lat", "lon"),
+        ),
+        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
+    ) { request ->
+        if (!strava.isConfigured) {
+            return@addTool errorResult(
+                "Strava is not configured: set STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET and STRAVA_REFRESH_TOKEN " +
+                    "in the server's environment (see README.md).",
+            )
+        }
+
+        val args = request.arguments ?: JsonObject(emptyMap())
+        val lat = args["lat"]?.jsonPrimitive?.double
+            ?: return@addTool errorResult("Parameter 'lat' is required")
+        val lon = args["lon"]?.jsonPrimitive?.double
+            ?: return@addTool errorResult("Parameter 'lon' is required")
+        val radiusKm = (args["radius_km"]?.jsonPrimitive?.double ?: 5.0).coerceIn(0.5, 25.0)
+        val activityType = args["activity_type"]?.jsonPrimitive?.content ?: "riding"
+        val limit = (args["limit"]?.jsonPrimitive?.intOrNull ?: 10).coerceIn(1, 20)
+
+        runCatching { strava.exploreSegments(lat, lon, radiusKm, activityType) }.fold(
+            onSuccess = { segments ->
+                if (segments.isEmpty()) {
+                    CallToolResult(content = listOf(TextContent("No segments found within ${fmt(radiusKm)} km")))
+                } else {
+                    val text = segments.take(limit).joinToString("\n\n") { s ->
+                        val start = s.startLatLng.takeIf { it.size == 2 }?.let { "${it[0]}, ${it[1]}" } ?: "?"
+                        val end = s.endLatLng.takeIf { it.size == 2 }?.let { "${it[0]}, ${it[1]}" } ?: "?"
+                        "${s.name} (${climbCategoryName(s.climbCategory)})\n" +
+                            "  ${fmt(s.distance / 1000)} km, avg grade ${fmt(s.avgGrade)}%, elevation +${s.elevDifference.toInt()} m\n" +
+                            "  start: $start → end: $end"
+                    }
+                    CallToolResult(content = listOf(TextContent(text)))
+                }
+            },
+            onFailure = { errorResult("Strava segments failed: ${it.message}") },
         )
     }
 }
