@@ -14,6 +14,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.nio.file.attribute.PosixFilePermissions
 import java.util.Locale
 import kotlin.math.cos
 
@@ -116,6 +117,16 @@ class StravaApi(
         if (response.status.value == 401) {
             response = attempt(refresh())
         }
+        if (response.status.value == 401) {
+            // Токен свежий и scope=read подтверждён при авторизации, но Strava всё равно отдаёт 401:
+            // с 1 сентября 2026 /segments/explore (и ряд других эндпоинтов) задеприцированы для всех,
+            // кроме приложений с одобренным Extended Access. Это не лечится повторной авторизацией.
+            error(
+                "Strava 401 после обновления токена — скорее всего, этот эндпоинт требует Extended Access " +
+                    "(Strava задеприцировала /segments/explore для обычного тира с 1 сентября 2026). " +
+                    "Прямой запрос сегмента по id (/segments/{id}) при этом продолжает работать.",
+            )
+        }
         if (!response.status.isSuccess()) {
             error("Strava ${response.status.value}: ${response.bodyAsText().take(300)}")
         }
@@ -155,6 +166,11 @@ class StravaApi(
         runCatching {
             cacheFile.parentFile?.mkdirs()
             cacheFile.writeText(json.encodeToString(StravaTokenCache(tokens.accessToken, tokens.refreshToken, tokens.expiresAt)))
+            // В кэше лежит refresh_token — долгоживущий секрет. writeText() создаёт файл с умолчаниями
+            // системы (обычно 644), это читаемо всеми в системе; запираем сразу после записи.
+            runCatching {
+                java.nio.file.Files.setPosixFilePermissions(cacheFile.toPath(), PosixFilePermissions.fromString("rw-------"))
+            }
         }
         return tokens.accessToken
     }
