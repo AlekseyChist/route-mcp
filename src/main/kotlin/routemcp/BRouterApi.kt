@@ -44,10 +44,16 @@ class BRouterApi(private val http: HttpClient, private val baseUrl: String) {
         waypoints: List<Pair<Double, Double>>, // (lat, lon)
         profile: String,
         alternative: Int,
+        // Круглые зоны-исключения: (lat, lon, радиус в метрах). BRouter будет прокладывать
+        // маршрут так, чтобы не заходить внутрь — удобно обойти конкретную улицу или район.
+        avoid: List<Triple<Double, Double, Double>> = emptyList(),
     ): RouteResult {
         // BRouter ждёт "lon,lat|lon,lat|..."
         val lonlats = waypoints.joinToString("|") { (lat, lon) ->
             String.format(Locale.US, "%.6f,%.6f", lon, lat)
+        }
+        val nogos = avoid.joinToString("|") { (lat, lon, radius) ->
+            String.format(Locale.US, "%.6f,%.6f,%.0f", lon, lat, radius)
         }
 
         val response = http.get("$baseUrl/brouter") {
@@ -55,6 +61,7 @@ class BRouterApi(private val http: HttpClient, private val baseUrl: String) {
             parameter("profile", profile)
             parameter("alternativeidx", alternative)
             parameter("format", "geojson")
+            if (nogos.isNotEmpty()) parameter("nogos", nogos)
         }
         // При ошибке BRouter отвечает простым текстом, например "unknown profile"
         if (!response.status.isSuccess()) {

@@ -144,6 +144,8 @@ private fun Server.registerPlanRoute(brouter: BRouterApi) {
             Profiles: fastbike (road bike, default), fastbike-lowtraffic (road, avoids busy roads),
             trekking (mixed surfaces, touring), safety (bike paths, quiet roads), shortest,
             hiking-mountain (on foot). For a loop, make the last waypoint equal to the first.
+            Use 'avoid' to steer around a specific street or area (e.g. "that road has no shoulder")
+            without fighting the waypoints — each entry is a circle the route won't enter.
         """.trimIndent(),
         inputSchema = ToolSchema(
             properties = buildJsonObject {
@@ -156,6 +158,22 @@ private fun Server.registerPlanRoute(brouter: BRouterApi) {
                         putJsonObject("properties") {
                             putJsonObject("lat") { put("type", "number") }
                             putJsonObject("lon") { put("type", "number") }
+                        }
+                        putJsonArray("required") { add("lat"); add("lon") }
+                    }
+                }
+                putJsonObject("avoid") {
+                    put("type", "array")
+                    put("description", "Circles the route must not enter, e.g. a street to skip")
+                    putJsonObject("items") {
+                        put("type", "object")
+                        putJsonObject("properties") {
+                            putJsonObject("lat") { put("type", "number") }
+                            putJsonObject("lon") { put("type", "number") }
+                            putJsonObject("radius_m") {
+                                put("type", "number")
+                                put("description", "Radius in meters, default 300")
+                            }
                         }
                         putJsonArray("required") { add("lat"); add("lon") }
                     }
@@ -188,12 +206,16 @@ private fun Server.registerPlanRoute(brouter: BRouterApi) {
         }
         if (waypoints.size < 2) return@addTool errorResult("Need at least 2 waypoints")
 
+        val avoid = runCatching { parseAvoid(args["avoid"]) }.getOrElse {
+            return@addTool errorResult("Bad 'avoid': ${it.message}")
+        }
+
         val profile = args["profile"]?.jsonPrimitive?.content ?: "fastbike"
         val alternative = args["alternative"]?.jsonPrimitive?.intOrNull ?: 0
         val name = args["name"]?.jsonPrimitive?.content ?: "route"
         val maxPoints = (args["max_points"]?.jsonPrimitive?.intOrNull ?: 350).coerceIn(50, 3000)
 
-        val route = runCatching { brouter.route(waypoints, profile, alternative.coerceIn(0, 3)) }
+        val route = runCatching { brouter.route(waypoints, profile, alternative.coerceIn(0, 3), avoid) }
             .getOrElse { return@addTool errorResult("Routing failed: ${it.message}") }
 
         // Полный трек — в файл на маке
@@ -312,6 +334,24 @@ private fun parseWaypoints(element: JsonElement?): List<Pair<Double, Double>> {
         val lon = obj.getValue("lon").jsonPrimitive.double
         require(lat in -90.0..90.0 && lon in -180.0..180.0) { "out of range: $lat, $lon" }
         lat to lon
+    }
+}
+
+/** 'avoid' необязателен: отсутствие или пустой массив — просто нет зон-исключений. */
+private fun parseAvoid(element: JsonElement?): List<Triple<Double, Double, Double>> {
+    if (element == null) return emptyList()
+    val array = if (element is JsonPrimitive && element.isString) {
+        Json.parseToJsonElement(element.content).jsonArray
+    } else {
+        element.jsonArray
+    }
+    return array.map { item ->
+        val obj = item.jsonObject
+        val lat = obj.getValue("lat").jsonPrimitive.double
+        val lon = obj.getValue("lon").jsonPrimitive.double
+        val radius = obj["radius_m"]?.jsonPrimitive?.double ?: 300.0
+        require(lat in -90.0..90.0 && lon in -180.0..180.0) { "out of range: $lat, $lon" }
+        Triple(lat, lon, radius.coerceIn(20.0, 5000.0))
     }
 }
 
