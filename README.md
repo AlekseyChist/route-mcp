@@ -8,7 +8,34 @@ MCP-сервер на Kotlin: строит велосипедные маршру
 |---|---|
 | `geocode` | Название места → координаты (Nominatim/OSM) |
 | `plan_route` | Точки → маршрут по дорогам: дистанция, набор, время + упрощённый GPX. Полный GPX сохраняется в `~/Routes`. `avoid` — круглые зоны-исключения, чтобы объехать конкретную улицу |
+| `plan_saved_route` | То же самое, но waypoints+avoid берутся из сохранённого пресета по имени — см. ниже |
+| `list_saved_routes` | Список сохранённых пресетов с описанием |
 | `find_popular_segments` | Точка → популярные сегменты Strava рядом (Segments Explore), с координатами старта/финиша для `plan_route` |
+
+## Сохранённые маршруты
+
+Набор waypoints под конкретный маршрут обычно собирается вручную — geocode, подбор улиц,
+`avoid`-зоны объездов, пока трек не ляжет именно так, как нужно. Чтобы не повторять это
+каждый раз, результат можно сохранить и потом вызывать по имени: `plan_saved_route("имя")`.
+
+Хранится в `~/Routes/presets.json` (путь меняется через `PRESETS_FILE`), правится руками —
+обычный текст, никакой сборки не нужно:
+
+```json
+{
+  "routes": {
+    "my-loop": {
+      "description": "Что это за маршрут",
+      "profile": "fastbike",
+      "waypoints": [{"lat": 44.80, "lon": 20.45}, ...],
+      "avoid": [{"lat": 44.72, "lon": 20.49, "radius_m": 400}]
+    }
+  }
+}
+```
+
+На первом запуске, если файла нет, сервер создаёт его с одним примером (маршрут от Авалы
+через Раковицу) — его можно отредактировать или удалить.
 
 ## Как это устроено
 
@@ -68,6 +95,7 @@ npx @modelcontextprotocol/inspector java -jar build/libs/route-mcp.jar
 
 - `BROUTER_URL`: свой сервер BRouter (по умолчанию `https://brouter.de`)
 - `ROUTES_DIR`: куда сохранять полные GPX (по умолчанию `~/Routes`)
+- `PRESETS_FILE`: файл сохранённых маршрутов (по умолчанию `~/Routes/presets.json`)
 - `STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET`, `STRAVA_REFRESH_TOKEN`: см. ниже
 - `STRAVA_CACHE_FILE`: куда сохранять обновлённый access/refresh token между перезапусками
   (по умолчанию `~/.secrets/route-mcp-strava-cache.json`)

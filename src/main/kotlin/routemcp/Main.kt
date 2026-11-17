@@ -53,6 +53,11 @@ private val STRAVA_CACHE_FILE = File(
     System.getenv("STRAVA_CACHE_FILE") ?: "${System.getProperty("user.home")}/.secrets/route-mcp-strava-cache.json",
 )
 
+// Готовые маршруты (waypoints+avoid под именем) — правится руками, см. PresetStore.
+private val PRESETS_FILE = File(
+    System.getenv("PRESETS_FILE") ?: "${System.getProperty("user.home")}/Routes/presets.json",
+)
+
 fun main() {
     // По stdout идёт JSON-RPC, и ничего кроме него: одна лишняя строка ломает транспорт.
     // Библиотеки об этом не знают (kotlin-logging печатает в stdout строку при инициализации),
@@ -74,8 +79,13 @@ fun main() {
                 capabilities = ServerCapabilities(tools = ServerCapabilities.Tools(listChanged = false)),
             ),
         )
+        val brouter = BRouterApi(http, BROUTER_URL)
+        val presets = PresetStore(PRESETS_FILE).also { it.ensureSeeded() }
+
         server.registerGeocode(Geocoder(http))
-        server.registerPlanRoute(BRouterApi(http, BROUTER_URL))
+        server.registerPlanRoute(brouter)
+        server.registerPlanSavedRoute(brouter, presets)
+        server.registerListSavedRoutes(presets)
         server.registerFindPopularSegments(
             StravaApi(http, STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRESH_TOKEN, STRAVA_CACHE_FILE),
         )
@@ -215,40 +225,106 @@ private fun Server.registerPlanRoute(brouter: BRouterApi) {
         val name = args["name"]?.jsonPrimitive?.content ?: "route"
         val maxPoints = (args["max_points"]?.jsonPrimitive?.intOrNull ?: 350).coerceIn(50, 3000)
 
-        val route = runCatching { brouter.route(waypoints, profile, alternative.coerceIn(0, 3), avoid) }
-            .getOrElse { return@addTool errorResult("Routing failed: ${it.message}") }
+        buildRouteResult(brouter, waypoints, avoid, profile, alternative.coerceIn(0, 3), name, maxPoints)
+    }
+}
 
-        // Полный трек — в файл на маке
-        val savedPath = runCatching {
-            ROUTES_DIR.mkdirs()
-            val file = File(ROUTES_DIR, "${safeFileName(name)}.gpx")
-            file.writeText(toGpx(name, route.points))
-            file.absolutePath
-        }.getOrElse { "not saved (${it.message})" }
+private fun Server.registerPlanSavedRoute(brouter: BRouterApi, presets: PresetStore) {
+    addTool(
+        name = "plan_saved_route",
+        description = "Build a route from a saved preset (waypoints+avoid zones already tuned by hand) — " +
+            "see list_saved_routes for names. Same output as plan_route: distance, elevation, GPX for COROS.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("name") { put("type", "string"); put("description", "Preset name") }
+                putJsonObject("max_points") {
+                    put("type", "integer")
+                    put("description", "Max points in the returned GPX, default 350")
+                }
+            },
+            required = listOf("name"),
+        ),
+        toolAnnotations = ToolAnnotations(readOnlyHint = false, openWorldHint = true),
+    ) { request ->
+        val args = request.arguments ?: JsonObject(emptyMap())
+        val presetName = args["name"]?.jsonPrimitive?.content
+            ?: return@addTool errorResult("Parameter 'name' is required")
+        val preset = presets.get(presetName)
+            ?: return@addTool errorResult("No saved route named '$presetName'. Call list_saved_routes to see what's available.")
+        val maxPoints = (args["max_points"]?.jsonPrimitive?.intOrNull ?: 350).coerceIn(50, 3000)
 
-        // Упрощённый — в ответ, чтобы его можно было сразу залить в COROS
-        val simplified = simplify(route.points, maxPoints)
-        val elevations = route.points.mapNotNull { it.ele }
-
-        val summary = buildString {
-            appendLine("Route: $name (profile $profile, alternative $alternative)")
-            appendLine("Distance: ${fmt(route.distanceMeters / 1000)} km")
-            appendLine("Elevation gain: ${route.ascentMeters.toInt()} m")
-            if (elevations.isNotEmpty()) {
-                appendLine("Elevation min/max: ${elevations.min().toInt()} / ${elevations.max().toInt()} m")
-            }
-            appendLine("BRouter time estimate: ${formatDuration(route.timeSeconds)}")
-            appendLine("Points: ${route.points.size} full → ${simplified.size} in GPX below")
-            append("Full GPX saved to: $savedPath")
-        }
-
-        CallToolResult(
-            content = listOf(
-                TextContent(summary),
-                TextContent(toGpx(name, simplified)),
-            ),
+        buildRouteResult(
+            brouter,
+            preset.waypoints.map { it.lat to it.lon },
+            preset.avoid.map { Triple(it.lat, it.lon, it.radiusM) },
+            preset.profile,
+            alternative = 0,
+            name = presetName,
+            maxPoints = maxPoints,
         )
     }
+}
+
+private fun Server.registerListSavedRoutes(presets: PresetStore) {
+    addTool(
+        name = "list_saved_routes",
+        description = "List saved route presets (name + description) that plan_saved_route can build.",
+        inputSchema = ToolSchema(properties = buildJsonObject {}, required = emptyList()),
+        toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = false),
+    ) {
+        val routes = presets.list()
+        val text = if (routes.isEmpty()) {
+            "No saved routes."
+        } else {
+            routes.entries.joinToString("\n\n") { (name, preset) -> "$name: ${preset.description}" }
+        }
+        CallToolResult(content = listOf(TextContent(text)))
+    }
+}
+
+/** Общий хвост plan_route и plan_saved_route: прогнать через BRouter, сохранить полный GPX, собрать ответ. */
+private suspend fun buildRouteResult(
+    brouter: BRouterApi,
+    waypoints: List<Pair<Double, Double>>,
+    avoid: List<Triple<Double, Double, Double>>,
+    profile: String,
+    alternative: Int,
+    name: String,
+    maxPoints: Int,
+): CallToolResult {
+    val route = runCatching { brouter.route(waypoints, profile, alternative, avoid) }
+        .getOrElse { return errorResult("Routing failed: ${it.message}") }
+
+    // Полный трек — в файл на маке
+    val savedPath = runCatching {
+        ROUTES_DIR.mkdirs()
+        val file = File(ROUTES_DIR, "${safeFileName(name)}.gpx")
+        file.writeText(toGpx(name, route.points))
+        file.absolutePath
+    }.getOrElse { "not saved (${it.message})" }
+
+    // Упрощённый — в ответ, чтобы его можно было сразу залить в COROS
+    val simplified = simplify(route.points, maxPoints)
+    val elevations = route.points.mapNotNull { it.ele }
+
+    val summary = buildString {
+        appendLine("Route: $name (profile $profile, alternative $alternative)")
+        appendLine("Distance: ${fmt(route.distanceMeters / 1000)} km")
+        appendLine("Elevation gain: ${route.ascentMeters.toInt()} m")
+        if (elevations.isNotEmpty()) {
+            appendLine("Elevation min/max: ${elevations.min().toInt()} / ${elevations.max().toInt()} m")
+        }
+        appendLine("BRouter time estimate: ${formatDuration(route.timeSeconds)}")
+        appendLine("Points: ${route.points.size} full → ${simplified.size} in GPX below")
+        append("Full GPX saved to: $savedPath")
+    }
+
+    return CallToolResult(
+        content = listOf(
+            TextContent(summary),
+            TextContent(toGpx(name, simplified)),
+        ),
+    )
 }
 
 private fun Server.registerFindPopularSegments(strava: StravaApi) {
